@@ -347,18 +347,185 @@ def get_space(doc: Any, space: Any = "model", *methods: str) -> Any:
     return flag_methods(target, *methods) if methods else target
 
 
+def com_point_mm_tuple(value: Any, scale: float) -> list[float] | None:
+    """A COM point variant (drawing units) -> [x, y, z] millimetres, or None.
+
+    Used only for *reading* geometry back. Every read goes through
+    optional_value at the call site, so a missing member yields None here
+    instead of raising; a malformed value can only come from a corrupt
+    drawing, and None is the honest answer for that too.
+    """
+
+    try:
+        coords = tuple(float(component) for component in value)
+    except (TypeError, ValueError):
+        return None
+    if len(coords) == 2:
+        coords = (coords[0], coords[1], 0.0)
+    if len(coords) != 3 or not all(math.isfinite(component) for component in coords):
+        return None
+    return [round(component / scale, 6) for component in coords]
+
+
+def com_length_mm(value: Any, scale: float) -> float | None:
+    """A COM length (drawing units) -> millimetres, or None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return round(parsed / scale, 6)
+
+
+def com_angle_deg(value: Any) -> float | None:
+    """A COM angle (radians) -> degrees, or None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return round(math.degrees(parsed), 6)
+
+
+def entity_geometry(entity: Any, object_name: str, scale: float) -> dict[str, Any] | None:
+    """Read an entity's defining geometry back in millimetres.
+
+    Additive read-only introspection: one small dict per supported type,
+    None for anything else. Keys mirror the `_mm`/`_deg` boundary
+    convention, and points are always [x, y, z]. Every COM read is
+    optional — a missing member degrades that key to omission (or the
+    whole geometry to None when a defining value is absent), never to an
+    exception, because this runs inside listing calls where one odd
+    entity must not fail the other 999.
+    """
+
+    get = lambda name: optional_value(entity, name, None)  # noqa: E731
+    if object_name == "AcDbLine":
+        start = com_point_mm_tuple(get("StartPoint"), scale)
+        end = com_point_mm_tuple(get("EndPoint"), scale)
+        if start is None or end is None:
+            return None
+        return {"start_mm": start, "end_mm": end}
+    if object_name == "AcDbCircle":
+        center = com_point_mm_tuple(get("Center"), scale)
+        radius = com_length_mm(get("Radius"), scale)
+        if center is None or radius is None:
+            return None
+        return {"center_mm": center, "radius_mm": radius}
+    if object_name == "AcDbArc":
+        center = com_point_mm_tuple(get("Center"), scale)
+        radius = com_length_mm(get("Radius"), scale)
+        start_angle = com_angle_deg(get("StartAngle"))
+        end_angle = com_angle_deg(get("EndAngle"))
+        if center is None or radius is None or start_angle is None or end_angle is None:
+            return None
+        return {"center_mm": center, "radius_mm": radius,
+                "start_angle_deg": start_angle, "end_angle_deg": end_angle}
+    if object_name == "AcDbEllipse":
+        center = com_point_mm_tuple(get("Center"), scale)
+        major_vector = get("MajorAxis")
+        ratio = get("RadiusRatio")
+        try:
+            major_drawing = math.dist((0.0, 0.0, 0.0), tuple(float(v) for v in major_vector))
+            ratio_parsed = float(ratio)
+        except (TypeError, ValueError):
+            return None
+        if center is None or not math.isfinite(major_drawing) or major_drawing <= 0:
+            return None
+        if not math.isfinite(ratio_parsed) or not 0 < ratio_parsed <= 1:
+            return None
+        try:
+            rotation = round(math.degrees(math.atan2(float(major_vector[1]), float(major_vector[0]))), 6)
+        except (TypeError, ValueError, IndexError):
+            return None
+        major_mm = round(major_drawing / scale, 6)
+        return {"center_mm": center, "major_axis_mm": major_mm,
+                "minor_axis_mm": round(major_mm * ratio_parsed, 6),
+                "rotation_deg": rotation}
+    if object_name == "AcDbPolyline":
+        raw = get("Coordinates")
+        try:
+            flat = [float(v) for v in raw]
+        except (TypeError, ValueError):
+            return None
+        if len(flat) < 4 or len(flat) % 2:
+            return None
+        vertices = [[round(flat[i] / scale, 6), round(flat[i + 1] / scale, 6)]
+                    for i in range(0, len(flat), 2)]
+        closed_raw = get("Closed")
+        closed = bool(closed_raw) if closed_raw is not None else None
+        elevation = com_length_mm(get("Elevation"), scale)
+        return {"vertices_mm": vertices, "closed": closed, "elevation_mm": elevation}
+    if object_name in ("AcDbText", "AcDbMText"):
+        position = com_point_mm_tuple(get("InsertionPoint"), scale)
+        try:
+            content = get("TextString")
+            content = str(content) if content is not None else None
+        except Exception:
+            content = None
+        height = com_length_mm(get("Height"), scale)
+        if position is None or content is None or height is None:
+            return None
+        return {"insertion_point_mm": position, "text": content, "height_mm": height}
+    if object_name == "AcDbPoint":
+        position = com_point_mm_tuple(get("Coordinates"), scale)
+        if position is None:
+            return None
+        return {"point_mm": position}
+    if object_name == "AcDbBlockReference":
+        position = com_point_mm_tuple(get("InsertionPoint"), scale)
+        if position is None:
+            return None
+        # Scale factors are unitless multipliers, not lengths: read raw.
+        raw_scales = []
+        for name in ("XScaleFactor", "YScaleFactor", "ZScaleFactor"):
+            raw = get(name)
+            try:
+                parsed = float(raw)
+                raw_scales.append(parsed if math.isfinite(parsed) and parsed != 0 else 1.0)
+            except (TypeError, ValueError):
+                raw_scales.append(1.0)
+        rotation = com_angle_deg(get("Rotation"))
+        try:
+            block_name = get("BlockName")
+            block_name = str(block_name) if block_name is not None else None
+        except Exception:
+            block_name = None
+        return {"insertion_point_mm": position, "block_name": block_name,
+                "scale": raw_scales, "rotation_deg": rotation}
+    if "Dimension" in object_name:
+        measured = com_length_mm(get("Measurement"), scale)
+        if measured is None:
+            return None
+        return {"measurement_mm": measured}
+    return None
+
+
 def entity_info(
     entity: Any,
     index: int | None = None,
     *,
     object_name: str | None = None,
     layer: str | None = None,
+    units_per_mm: float | None = None,
 ) -> dict[str, Any]:
     """Describe one entity.  Every property read here is a COM round trip.
 
     ``object_name`` and ``layer`` let a caller that already read those values --
     query_entities reads both to filter on them -- hand them back instead of
     paying for the same two round trips a second time per entity.
+
+    ``units_per_mm`` enables the ``geometry`` read-back (per-type coordinates
+    in millimetres; None when the caller has no document scale at hand, and
+    None per unsupported type).  Callers that already hold the document --
+    every tool handler does -- pass ``drawing_units_per_mm(doc)`` so listing
+    calls cost one scale lookup no matter how many entities follow.
     """
 
     payload: dict[str, Any] = {
@@ -370,6 +537,13 @@ def entity_info(
     }
     if index is not None:
         payload["index"] = index
+    if units_per_mm is None:
+        payload["geometry"] = None
+    else:
+        try:
+            payload["geometry"] = entity_geometry(entity, str(payload["object_name"]), units_per_mm)
+        except Exception:
+            payload["geometry"] = None
     return payload
 
 
@@ -429,8 +603,8 @@ def discover_template() -> Path | None:
     return None
 
 
-def _new_entity_result(entity: Any, message: str, **extra: Any) -> dict[str, Any]:
-    return result(True, message, entity=entity_info(entity), **extra)
+def _new_entity_result(entity: Any, message: str, units_per_mm: float | None = None, **extra: Any) -> dict[str, Any]:
+    return result(True, message, entity=entity_info(entity, units_per_mm=units_per_mm), **extra)
 
 
 # --------------------------------------------------------------------------
@@ -739,6 +913,7 @@ def query_entities(arguments: dict[str, Any]) -> dict[str, Any]:
     with com_apartment():
         doc = active_document(running_app())
         # No Add* method is called here, so no name needs flagging.
+        scale = drawing_units_per_mm(doc)
         collection = get_space(doc, arguments.get("space", "model"))
         total = int(collection.Count)
         items: list[dict[str, Any]] = []
@@ -754,7 +929,7 @@ def query_entities(arguments: dict[str, Any]) -> dict[str, Any]:
             layer = str(optional_value(entity, "Layer", ""))
             if wanted_layer and layer != wanted_layer:
                 continue
-            items.append(entity_info(entity, index, object_name=object_name, layer=layer))
+            items.append(entity_info(entity, index, object_name=object_name, layer=layer, units_per_mm=scale))
             if len(items) >= limit:
                 break
         # "Truncated" means the scan stopped short of the end of the space, not
@@ -900,7 +1075,7 @@ def set_entity_layer(arguments: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(f"Layer {layer_name!r} does not exist") from exc
         entity = get_entity_by_handle(doc, arguments["handle"])
         entity.Layer = layer_name
-        return _new_entity_result(entity, "Updated entity layer.")
+        return _new_entity_result(entity, "Updated entity layer.", units_per_mm=drawing_units_per_mm(doc))
 
 
 # --------------------------------------------------------------------------
@@ -962,7 +1137,7 @@ def draw_line(arguments: dict[str, Any]) -> dict[str, Any]:
             com_point_mm(arguments["end_mm"], scale, "end_mm"),
         )
         apply_layer(entity, layer)
-        return _new_entity_result(entity, "Added line.")
+        return _new_entity_result(entity, "Added line.", units_per_mm=scale)
 
 
 @tool(
@@ -981,7 +1156,7 @@ def draw_circle(arguments: dict[str, Any]) -> dict[str, Any]:
             com_point_mm(arguments["center_mm"], scale, "center_mm"), radius * scale
         )
         apply_layer(entity, layer)
-        return _new_entity_result(entity, "Added circle.")
+        return _new_entity_result(entity, "Added circle.", units_per_mm=scale)
 
 
 @tool(
@@ -1030,6 +1205,7 @@ def draw_polyline(arguments: dict[str, Any]) -> dict[str, Any]:
         return _new_entity_result(
             entity,
             "Added lightweight polyline.",
+            units_per_mm=scale,
             vertices=len(vertices),
             elevation_mm=round(elevation / scale, 6),
         )
@@ -1060,7 +1236,7 @@ def draw_text(arguments: dict[str, Any]) -> dict[str, Any]:
             text, com_point_mm(arguments["insertion_point_mm"], scale, "insertion_point_mm"), height * scale
         )
         apply_layer(entity, layer)
-        return _new_entity_result(entity, "Added text.")
+        return _new_entity_result(entity, "Added text.", units_per_mm=scale)
 
 
 @tool(
@@ -1102,7 +1278,7 @@ def draw_arc(arguments: dict[str, Any]) -> dict[str, Any]:
             math.radians(end_deg),
         )
         apply_layer(entity, layer)
-        return _new_entity_result(entity, "Added arc.", sweep_deg=round(sweep_deg, 9))
+        return _new_entity_result(entity, "Added arc.", units_per_mm=units_per_mm, sweep_deg=round(sweep_deg, 9))
 
 
 @tool(
@@ -1162,6 +1338,7 @@ def draw_ellipse(arguments: dict[str, Any]) -> dict[str, Any]:
         return _new_entity_result(
             entity,
             "Added ellipse.",
+            units_per_mm=units_per_mm,
             radius_ratio=round(minor / major, 9),
             rotation_deg=rotation_deg,
         )
@@ -1183,7 +1360,7 @@ def draw_point(arguments: dict[str, Any]) -> dict[str, Any]:
             com_point_mm(arguments["point_mm"], units_per_mm, "point_mm")
         )
         apply_layer(entity, layer)
-        return _new_entity_result(entity, "Added point.")
+        return _new_entity_result(entity, "Added point.", units_per_mm=units_per_mm)
 
 
 @tool(
@@ -1240,6 +1417,7 @@ def insert_block(arguments: dict[str, Any]) -> dict[str, Any]:
         return _new_entity_result(
             entity,
             "Inserted block reference.",
+            units_per_mm=units_per_mm,
             block_name=block_name,
             scale=block_scale,
             rotation_deg=rotation_deg,
@@ -1324,6 +1502,7 @@ def add_linear_dimension(arguments: dict[str, Any]) -> dict[str, Any]:
         return _new_entity_result(
             entity,
             "Added linear dimension.",
+            units_per_mm=units_per_mm,
             orientation=orientation,
             rotation_deg=rotation_deg,
             measurement_mm=measured_mm,
@@ -1349,7 +1528,7 @@ def erase_entity(arguments: dict[str, Any]) -> dict[str, Any]:
         # Described before it is deleted: once Delete returns, the wrapper points
         # at an object that is gone and every property read raises, so the reply
         # could not say what was actually removed.
-        info = entity_info(entity)
+        info = entity_info(entity, units_per_mm=drawing_units_per_mm(doc))
         flag_methods(entity, "Delete").Delete()
         return result(True, "Deleted entity.", entity=info)
 
@@ -1378,6 +1557,7 @@ def move_entity(arguments: dict[str, Any]) -> dict[str, Any]:
         return _new_entity_result(
             entity,
             "Moved entity.",
+            units_per_mm=units_per_mm,
             displacement_mm=[round((e - s) / units_per_mm, 6) for s, e in zip(start, end)],
         )
 
@@ -1405,13 +1585,13 @@ def copy_entity(arguments: dict[str, Any]) -> dict[str, Any]:
             else None
         )
         entity = get_entity_by_handle(doc, arguments["handle"])
-        source = entity_info(entity)
+        source = entity_info(entity, units_per_mm=units_per_mm)
         duplicate = flag_methods(entity, "Copy").Copy()
         if displacement is not None and any(displacement):
             flag_methods(duplicate, "Move").Move(
                 com_double_array((0.0, 0.0, 0.0)), com_double_array(displacement)
             )
-        return _new_entity_result(duplicate, "Copied entity.", source=source)
+        return _new_entity_result(duplicate, "Copied entity.", units_per_mm=units_per_mm, source=source)
 
 
 @tool("zoom_extents", "Zoom the active AutoCAD view so visible drawing content fits the window.")

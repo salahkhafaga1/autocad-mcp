@@ -1310,5 +1310,122 @@ class DrawToolFlaggingTests(unittest.TestCase):
                 self.assertEqual(run.space_calls, [(None, (expected,))])
 
 
+class GeoEntity(FakeEntity):
+    """FakeEntity plus type-specific COM members, in drawing units."""
+
+    def __init__(self, handle: str, object_name: str, layer: str, **members: object) -> None:
+        super().__init__(handle, object_name, layer)
+        for name, value in members.items():
+            setattr(self, name, value)
+
+
+class GeometryReadbackTests(unittest.TestCase):
+    """Stage S1: entity payloads carry defining geometry in millimetres.
+
+    Fixture values are written in drawing units and asserted back in
+    millimetres, so a wrong scale factor fails loudly here instead of
+    silently misplacing a wall on a real drawing.
+    """
+
+    def test_line_endpoints_round_trip_in_mm(self) -> None:
+        entity = GeoEntity("L1", "AcDbLine", "WALLS", StartPoint=(0.0, 0.0, 0.0), EndPoint=(6000.0, 4000.0, 0.0))
+        geometry = acad_core.entity_info(entity, units_per_mm=1.0)["geometry"]
+        self.assertEqual(geometry, {"start_mm": [0.0, 0.0, 0.0], "end_mm": [6000.0, 4000.0, 0.0]})
+
+    def test_metre_drawing_converts_to_mm(self) -> None:
+        entity = GeoEntity("L2", "AcDbLine", "WALLS", StartPoint=(1.0, 2.0, 0.0), EndPoint=(4.0, 6.0, 0.0))
+        doc = FakeDocument(insunits=6)
+        run = run_tool("query_entities", {}, doc=doc, space=FakeSpace([entity]))
+        geometry = run.data["entities"][0]["geometry"]
+        self.assertEqual(geometry, {"start_mm": [1000.0, 2000.0, 0.0], "end_mm": [4000.0, 6000.0, 0.0]})
+
+    def test_circle_arc_text_point(self) -> None:
+        circle = GeoEntity("C1", "AcDbCircle", "0", Center=(10.0, 10.0, 0.0), Radius=5.0)
+        self.assertEqual(
+            acad_core.entity_info(circle, units_per_mm=1.0)["geometry"],
+            {"center_mm": [10.0, 10.0, 0.0], "radius_mm": 5.0},
+        )
+        arc = GeoEntity("A1", "AcDbArc", "0", Center=(0.0, 0.0, 0.0), Radius=900.0,
+                        StartAngle=0.0, EndAngle=math.pi / 2)
+        self.assertEqual(
+            acad_core.entity_info(arc, units_per_mm=1.0)["geometry"],
+            {"center_mm": [0.0, 0.0, 0.0], "radius_mm": 900.0,
+             "start_angle_deg": 0.0, "end_angle_deg": 90.0},
+        )
+        text = GeoEntity("T1", "AcDbText", "0", InsertionPoint=(1.0, 2.0, 0.0),
+                         TextString="Room A", Height=2.5)
+        self.assertEqual(
+            acad_core.entity_info(text, units_per_mm=1.0)["geometry"],
+            {"insertion_point_mm": [1.0, 2.0, 0.0], "text": "Room A", "height_mm": 2.5},
+        )
+        point = GeoEntity("P1", "AcDbPoint", "0", Coordinates=(5.0, 5.0, 0.0))
+        self.assertEqual(
+            acad_core.entity_info(point, units_per_mm=1.0)["geometry"],
+            {"point_mm": [5.0, 5.0, 0.0]},
+        )
+
+    def test_polyline_vertices_closed_elevation(self) -> None:
+        entity = GeoEntity("PL1", "AcDbPolyline", "WALLS",
+                           Coordinates=(0.0, 0.0, 6000.0, 0.0, 6000.0, 4000.0, 0.0, 4000.0),
+                           Closed=True, Elevation=0.0)
+        self.assertEqual(
+            acad_core.entity_info(entity, units_per_mm=1.0)["geometry"],
+            {"vertices_mm": [[0.0, 0.0], [6000.0, 0.0], [6000.0, 4000.0], [0.0, 4000.0]],
+             "closed": True, "elevation_mm": 0.0},
+        )
+
+    def test_block_reference_fields(self) -> None:
+        entity = GeoEntity("B1", "AcDbBlockReference", "DOORS", InsertionPoint=(3.0, 0.0, 0.0),
+                           BlockName="DOOR-900", XScaleFactor=1.0, YScaleFactor=2.0,
+                           ZScaleFactor=1.0, Rotation=math.pi / 4)
+        self.assertEqual(
+            acad_core.entity_info(entity, units_per_mm=1.0)["geometry"],
+            {"insertion_point_mm": [3.0, 0.0, 0.0], "block_name": "DOOR-900",
+             "scale": [1.0, 2.0, 1.0], "rotation_deg": 45.0},
+        )
+
+    def test_dimension_measurement(self) -> None:
+        run = run_tool("query_entities", {}, space=FakeSpace([FakeDimension(measurement=6000.0)]))
+        self.assertEqual(run.data["entities"][0]["geometry"], {"measurement_mm": 6000.0})
+
+    def test_ellipse_semiaxes(self) -> None:
+        entity = GeoEntity("E1", "AcDbEllipse", "0", Center=(0.0, 0.0, 0.0),
+                           MajorAxis=(60.0, 0.0, 0.0), RadiusRatio=0.5)
+        self.assertEqual(
+            acad_core.entity_info(entity, units_per_mm=1.0)["geometry"],
+            {"center_mm": [0.0, 0.0, 0.0], "major_axis_mm": 60.0,
+             "minor_axis_mm": 30.0, "rotation_deg": 0.0},
+        )
+
+    def test_unsupported_type_returns_none(self) -> None:
+        entity = FakeEntity("H1", "AcDbHatch", "0")
+        self.assertIsNone(acad_core.entity_info(entity, units_per_mm=1.0)["geometry"])
+
+    def test_missing_members_degrade_to_none_without_raising(self) -> None:
+        entity = FakeEntity("L9", "AcDbLine", "WALLS")
+        self.assertIsNone(acad_core.entity_info(entity, units_per_mm=1.0)["geometry"])
+
+    def test_no_scale_means_no_geometry(self) -> None:
+        entity = GeoEntity("L1", "AcDbLine", "WALLS", StartPoint=(0.0, 0.0, 0.0), EndPoint=(1.0, 1.0, 0.0))
+        self.assertIsNone(acad_core.entity_info(entity)["geometry"])
+
+    def test_draw_result_carries_geometry_key(self) -> None:
+        run = run_tool("draw_line", {"start_mm": [0, 0], "end_mm": [100, 0]})
+        self.assertIn("geometry", run.data["entity"])
+
+    def test_erase_reports_geometry_before_delete(self) -> None:
+        entity = GeoEntity("L1", "AcDbLine", "WALLS", StartPoint=(0.0, 0.0, 0.0), EndPoint=(5.0, 0.0, 0.0))
+        doc = FakeDocument(entities=[entity])
+        run = run_tool("erase_entity", {"handle": "L1"}, doc=doc)
+        self.assertEqual(run.data["entity"]["geometry"],
+                         {"start_mm": [0.0, 0.0, 0.0], "end_mm": [5.0, 0.0, 0.0]})
+
+    def test_move_result_carries_geometry_key(self) -> None:
+        entity = GeoEntity("L1", "AcDbLine", "WALLS", StartPoint=(0.0, 0.0, 0.0), EndPoint=(5.0, 0.0, 0.0))
+        doc = FakeDocument(entities=[entity])
+        run = run_tool("move_entity", {"handle": "L1", "from_mm": [0, 0], "to_mm": [30, 40]}, doc=doc)
+        self.assertIn("geometry", run.data["entity"])
+
+
 if __name__ == "__main__":
     unittest.main()
