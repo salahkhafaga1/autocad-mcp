@@ -1678,3 +1678,460 @@ def capture_screenshot(arguments: dict[str, Any]) -> dict[str, Any]:
     )
     payload["_image_png_base64"] = base64.b64encode(data).decode("ascii")
     return payload
+
+
+# --------------------------------------------------------------------------
+# Batch drawing, multiline text, layer appearance, explicit save
+# --------------------------------------------------------------------------
+
+
+# AutoCAD exposes a fixed set of lineweights; a layer's Lineweight is one of
+# these values in hundredths of a millimetre.  Anything else is coerced to the
+# nearest value by AutoCAD, so it is refused here instead of silently changed.
+STANDARD_LINEWEIGHTS_MM = (
+    0.0, 0.05, 0.09, 0.13, 0.15, 0.18, 0.20, 0.25, 0.30, 0.35, 0.40,
+    0.50, 0.53, 0.60, 0.70, 0.80, 0.90, 1.00, 1.06, 1.20, 1.40, 1.58,
+    2.00, 2.11,
+)
+
+# The entity kinds draw_batch can create, and the item fields each one needs.
+# Field names and units match the single-entity draw tools, so a batch item is
+# just that tool's arguments plus a "kind" tag.
+BATCH_ITEM_FIELDS = {
+    "line": ("start_mm", "end_mm"),
+    "circle": ("center_mm", "radius_mm"),
+    "polyline": ("vertices_mm",),
+    "text": ("text", "insertion_point_mm", "height_mm"),
+    "arc": ("center_mm", "radius_mm", "start_angle_deg", "end_angle_deg"),
+    "ellipse": ("center_mm", "major_axis_mm", "minor_axis_mm"),
+    "point": ("point_mm",),
+}
+BATCH_ADD_METHODS = (
+    "AddLine", "AddCircle", "AddLightWeightPolyline", "AddText",
+    "AddArc", "AddEllipse", "AddPoint",
+)
+MAX_BATCH_ITEMS = 200
+
+
+def command_active(doc: Any) -> bool | None:
+    """Best-effort check for an in-progress AutoCAD command, or None if unknown.
+
+    ``CMDACTIVE`` is an integer bitcode; zero means idle.  AutoCAD does not
+    guarantee the variable is readable through ActiveX while a command is
+    running -- and a COM call typically blocks or fails in that state anyway --
+    so an unreadable value is reported as None (unknown) rather than guessed.
+    """
+
+    try:
+        value = doc.GetVariable("CMDACTIVE")
+    except Exception:
+        return None
+    try:
+        return int(value) != 0
+    except (TypeError, ValueError):
+        return None
+
+
+def require_idle(doc: Any) -> None:
+    """Refuse to start a long-running write while AutoCAD reports a running command."""
+
+    if command_active(doc):
+        raise RuntimeError(
+            "AutoCAD is busy: a command is currently active. Finish or cancel it in AutoCAD, then retry."
+        )
+
+
+def lineweight_hundredths(value: Any, name: str = "lineweight_mm") -> int:
+    """Validate a millimetre lineweight against AutoCAD's fixed set."""
+
+    parsed = number(value, name)
+    if not any(abs(parsed - standard) < 1e-9 for standard in STANDARD_LINEWEIGHTS_MM):
+        allowed = ", ".join(f"{standard:g}" for standard in STANDARD_LINEWEIGHTS_MM)
+        raise ValueError(f"{name} must be one of AutoCAD's standard lineweights in mm: {allowed}")
+    return int(round(parsed * 100))
+
+
+def parse_batch_item(item: dict[str, Any], index: int, scale: float) -> dict[str, Any]:
+    """Validate and pre-compute one batch item.  Raises before anything is drawn."""
+
+    kind = item["kind"]
+    prefix = f"operations[{index}]"
+
+    def point(key: str) -> tuple[float, float, float]:
+        return point_mm(item[key], scale, f"{prefix}.{key}")
+
+    def scaled_positive(key: str) -> float:
+        return positive_number(item[key], f"{prefix}.{key}") * scale
+
+    prepared: dict[str, Any] = {
+        "kind": kind,
+        "layer": item.get("layer"),
+        "index": index,
+    }
+    if kind == "line":
+        prepared["start"] = point("start_mm")
+        prepared["end"] = point("end_mm")
+    elif kind == "circle":
+        prepared["center"] = point("center_mm")
+        prepared["radius"] = scaled_positive("radius_mm")
+    elif kind == "polyline":
+        vertices = item["vertices_mm"]
+        if not isinstance(vertices, list) or len(vertices) < 2:
+            raise ValueError(f"{prefix}.vertices_mm must contain at least two vertices")
+        points = [point_mm(vertex, scale, f"{prefix}.vertices_mm[{i}]") for i, vertex in enumerate(vertices)]
+        elevations = {round(p[2], 9) for p in points}
+        if len(elevations) > 1:
+            raise ValueError(
+                f"{prefix}.vertices_mm must share a single z value, because a lightweight polyline is planar"
+            )
+        prepared["coordinates"] = [coordinate for p in points for coordinate in (p[0], p[1])]
+        prepared["elevation"] = elevations.pop() if elevations else 0.0
+        prepared["closed"] = bool(item.get("closed", False))
+    elif kind == "text":
+        text = item["text"]
+        if not isinstance(text, str) or not text:
+            raise ValueError(f"{prefix}.text must be a non-empty string")
+        prepared["text"] = text
+        prepared["point"] = point("insertion_point_mm")
+        prepared["height"] = scaled_positive("height_mm")
+    elif kind == "arc":
+        start = number(item["start_angle_deg"], f"{prefix}.start_angle_deg")
+        end = number(item["end_angle_deg"], f"{prefix}.end_angle_deg")
+        sweep = (end - start) % 360.0
+        if sweep == 0.0:
+            raise ValueError(
+                f"{prefix} start_angle_deg and end_angle_deg describe a zero-degree sweep; use kind 'circle'"
+            )
+        prepared.update(
+            center=point("center_mm"),
+            radius=scaled_positive("radius_mm"),
+            start_deg=start,
+            end_deg=end,
+            sweep_deg=round(sweep, 9),
+        )
+    elif kind == "ellipse":
+        major = positive_number(item["major_axis_mm"], f"{prefix}.major_axis_mm")
+        minor = positive_number(item["minor_axis_mm"], f"{prefix}.minor_axis_mm")
+        if minor > major:
+            raise ValueError(f"{prefix}.minor_axis_mm must not exceed major_axis_mm")
+        prepared.update(
+            center=point("center_mm"),
+            major=major * scale,
+            ratio=minor / major,
+            rotation_deg=number(item.get("rotation_deg", 0.0), f"{prefix}.rotation_deg"),
+        )
+    elif kind == "point":
+        prepared["point"] = point("point_mm")
+    return prepared
+
+
+def create_batch_item(space: Any, prepared: dict[str, Any]) -> Any:
+    """Create one already-validated batch item."""
+
+    kind = prepared["kind"]
+    if kind == "line":
+        return space.AddLine(com_double_array(prepared["start"]), com_double_array(prepared["end"]))
+    if kind == "circle":
+        return space.AddCircle(com_double_array(prepared["center"]), prepared["radius"])
+    if kind == "polyline":
+        entity = space.AddLightWeightPolyline(com_double_array(prepared["coordinates"]))
+        if prepared["elevation"]:
+            entity.Elevation = prepared["elevation"]
+        entity.Closed = prepared["closed"]
+        return entity
+    if kind == "text":
+        return space.AddText(prepared["text"], com_double_array(prepared["point"]), prepared["height"])
+    if kind == "arc":
+        return space.AddArc(
+            com_double_array(prepared["center"]),
+            prepared["radius"],
+            math.radians(prepared["start_deg"]),
+            math.radians(prepared["end_deg"]),
+        )
+    if kind == "ellipse":
+        radians = math.radians(prepared["rotation_deg"])
+        major_axis = (
+            prepared["major"] * math.cos(radians),
+            prepared["major"] * math.sin(radians),
+            0.0,
+        )
+        return space.AddEllipse(com_double_array(prepared["center"]), com_double_array(major_axis), prepared["ratio"])
+    if kind == "point":
+        return space.AddPoint(com_double_array(prepared["point"]))
+    raise ValueError(f"unknown batch kind {kind!r}")
+
+
+@tool(
+    "draw_batch",
+    "Create many entities in one call. Every item is validated before any geometry is created, and the "
+    "whole batch is grouped as a single undo step. Each item is {kind, ...fields}, using the same field "
+    "names and units as the matching single-entity draw tool.",
+    {
+        "operations": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_BATCH_ITEMS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": sorted(BATCH_ITEM_FIELDS)},
+                    "layer": LAYER_SCHEMA,
+                    "start_mm": POINT_SCHEMA,
+                    "end_mm": POINT_SCHEMA,
+                    "center_mm": POINT_SCHEMA,
+                    "point_mm": POINT_SCHEMA,
+                    "insertion_point_mm": POINT_SCHEMA,
+                    "vertices_mm": {"type": "array", "minItems": 2, "items": POINT_SCHEMA},
+                    "radius_mm": {"type": "number", "exclusiveMinimum": 0},
+                    "height_mm": {"type": "number", "exclusiveMinimum": 0},
+                    "major_axis_mm": {"type": "number", "exclusiveMinimum": 0},
+                    "minor_axis_mm": {"type": "number", "exclusiveMinimum": 0},
+                    "start_angle_deg": {"type": "number"},
+                    "end_angle_deg": {"type": "number"},
+                    "rotation_deg": {"type": "number", "default": 0.0},
+                    "closed": {"type": "boolean", "default": False},
+                    "text": {"type": "string", "minLength": 1},
+                },
+                "required": ["kind"],
+            },
+        },
+        "space": SPACE_SCHEMA,
+    },
+    ["operations"],
+)
+def draw_batch(arguments: dict[str, Any]) -> dict[str, Any]:
+    operations = arguments["operations"]
+    if not isinstance(operations, list) or not operations:
+        raise ValueError("operations must be a non-empty list")
+    if len(operations) > MAX_BATCH_ITEMS:
+        raise ValueError(f"operations must contain at most {MAX_BATCH_ITEMS} items")
+    for index, item in enumerate(operations):
+        if not isinstance(item, dict):
+            raise ValueError(f"operations[{index}] must be an object")
+        kind = item.get("kind")
+        if kind not in BATCH_ITEM_FIELDS:
+            allowed = ", ".join(sorted(BATCH_ITEM_FIELDS))
+            raise ValueError(f"operations[{index}].kind must be one of: {allowed}")
+        for field in BATCH_ITEM_FIELDS[kind]:
+            if field not in item:
+                raise ValueError(f"operations[{index}] ({kind}) is missing {field!r}")
+
+    with com_apartment():
+        doc = active_document(running_app())
+        require_idle(doc)
+        scale = drawing_units_per_mm(doc)
+        # Every layer and every value is validated before a single entity is
+        # created, so a bad item costs nothing instead of half a batch.
+        for index, item in enumerate(operations):
+            resolve_layer(doc, item)
+        prepared = [parse_batch_item(item, index, scale) for index, item in enumerate(operations)]
+        space = get_space(doc, arguments.get("space"), *BATCH_ADD_METHODS)
+
+        created: list[dict[str, Any]] = []
+        failed_index: int | None = None
+        failure: str | None = None
+        # Group the whole batch as one undo step.  EndUndoMark runs even when an
+        # item fails, so the mark is never left open.
+        doc.StartUndoMark()
+        try:
+            for item in prepared:
+                try:
+                    entity = create_batch_item(space, item)
+                except Exception as exc:
+                    failed_index = item["index"]
+                    failure = str(exc)
+                    break
+                apply_layer(entity, item["layer"])
+                created.append({
+                    "index": item["index"],
+                    "kind": item["kind"],
+                    "entity": entity_info(entity, units_per_mm=scale),
+                })
+        finally:
+            doc.EndUndoMark()
+
+        total = len(prepared)
+        space_name = str(arguments.get("space") or "model")
+        if failed_index is None:
+            return result(
+                True,
+                f"Created {len(created)} entities in one undo group.",
+                created=created,
+                created_count=len(created),
+                requested=total,
+                failed_index=None,
+                space=space_name,
+                undo_grouped=True,
+            )
+        # Nothing is rolled back automatically: AutoCAD COM has no supported way
+        # to abort an open undo mark, so the exact partial result is reported and
+        # the group is left for a single Undo to remove.
+        return result(
+            False,
+            f"Created {len(created)} of {total} entities before item {failed_index} failed: {failure}. "
+            "Those entities share one undo group, so a single Undo removes them; nothing was rolled back "
+            "automatically.",
+            created=created,
+            created_count=len(created),
+            requested=total,
+            failed_index=failed_index,
+            failed_kind=prepared[failed_index]["kind"],
+            space=space_name,
+            undo_grouped=True,
+        )
+
+
+@tool(
+    "draw_mtext",
+    "Add a multiline text (MText) entity in model or paper space. Point, height, and width are millimetres.",
+    {
+        "text": {"type": "string", "minLength": 1},
+        "insertion_point_mm": POINT_SCHEMA,
+        "height_mm": {"type": "number", "exclusiveMinimum": 0},
+        "width_mm": {
+            "type": "number",
+            "minimum": 0,
+            "default": 0.0,
+            "description": "Wrapping width in mm; 0 means an unconstrained box.",
+        },
+        "rotation_deg": {"type": "number", "default": 0.0},
+        "layer": LAYER_SCHEMA,
+        "space": SPACE_SCHEMA,
+    },
+    ["text", "insertion_point_mm", "height_mm"],
+)
+def draw_mtext(arguments: dict[str, Any]) -> dict[str, Any]:
+    text = arguments["text"]
+    if not isinstance(text, str) or not text:
+        raise ValueError("text must be a non-empty string")
+    height = positive_number(arguments["height_mm"], "height_mm")
+    width = number(arguments.get("width_mm", 0.0), "width_mm")
+    if width < 0:
+        raise ValueError("width_mm must not be negative")
+    rotation_deg = number(arguments.get("rotation_deg", 0.0), "rotation_deg")
+    with com_apartment():
+        doc = active_document(running_app())
+        scale = drawing_units_per_mm(doc)
+        layer = resolve_layer(doc, arguments)
+        entity = get_space(doc, arguments.get("space"), "AddMText").AddMText(
+            com_point_mm(arguments["insertion_point_mm"], scale, "insertion_point_mm"),
+            width * scale,
+            text,
+        )
+        entity.Height = height * scale
+        entity.Rotation = math.radians(rotation_deg)
+        apply_layer(entity, layer)
+        return _new_entity_result(
+            entity,
+            "Added multiline text.",
+            units_per_mm=scale,
+            width_mm=round(width, 6),
+            rotation_deg=rotation_deg,
+        )
+
+
+@tool(
+    "set_layer_linetype",
+    "Set the linetype and/or lineweight of an existing layer. The linetype must already be loaded in the "
+    "drawing. Supply at least one of linetype or lineweight_mm.",
+    {
+        "name": {"type": "string"},
+        "linetype": {"type": "string", "description": "An existing, already-loaded linetype name."},
+        "lineweight_mm": {
+            "type": "number",
+            "description": "One of AutoCAD's standard lineweights in millimetres.",
+        },
+    },
+    ["name"],
+)
+def set_layer_linetype(arguments: dict[str, Any]) -> dict[str, Any]:
+    name = str(arguments["name"]).strip()
+    if not name:
+        raise ValueError("name must not be empty")
+    if "linetype" not in arguments and "lineweight_mm" not in arguments:
+        raise ValueError("supply at least one of: linetype, lineweight_mm")
+    linetype = None
+    if "linetype" in arguments:
+        raw = arguments["linetype"]
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("linetype must be a non-empty existing linetype name")
+        linetype = raw.strip()
+    # Parsed before any write, so a rejected value cannot leave the layer half-updated.
+    hundredths = lineweight_hundredths(arguments["lineweight_mm"]) if "lineweight_mm" in arguments else None
+
+    with com_apartment():
+        doc = active_document(running_app())
+        try:
+            layer = doc.Layers.Item(name)
+        except Exception as exc:
+            raise RuntimeError(f"Layer {name!r} does not exist; create it with create_layer first.") from exc
+        if linetype is not None:
+            try:
+                doc.Linetypes.Item(linetype)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Linetype {linetype!r} is not loaded in this drawing. Load it in AutoCAD first."
+                ) from exc
+        changed: list[str] = []
+        if linetype is not None:
+            layer.Linetype = linetype
+            changed.append("linetype")
+        if hundredths is not None:
+            layer.Lineweight = hundredths
+            changed.append("lineweight_mm")
+        return result(
+            True,
+            "Updated layer linetype/lineweight.",
+            layer={
+                "name": str(optional_value(layer, "Name", "")),
+                "linetype": str(optional_value(layer, "Linetype", "")),
+                "lineweight_mm": round(int(optional_value(layer, "Lineweight", 0)) / 100.0, 6),
+            },
+            changed=changed,
+        )
+
+
+@tool(
+    "save_drawing_explicit",
+    "Save the active drawing to an explicit absolute .dwg or .dxf path. An existing file at that path "
+    "is always refused; this tool never overwrites and never creates folders.",
+    {
+        "path": {
+            "type": "string",
+            "description": "Absolute .dwg or .dxf path whose parent folder already exists.",
+        },
+    },
+    ["path"],
+)
+def save_drawing_explicit(arguments: dict[str, Any]) -> dict[str, Any]:
+    raw = arguments["path"]
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("path must be a non-empty absolute .dwg or .dxf path")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("path must be absolute")
+    candidate = candidate.resolve()
+    if candidate.suffix.lower() not in {".dwg", ".dxf"}:
+        raise ValueError("path must have a .dwg or .dxf extension")
+    if candidate.exists():
+        raise RuntimeError(f"Refusing to overwrite the existing path {candidate}.")
+    if not candidate.parent.is_dir():
+        raise RuntimeError(
+            f"Parent folder {candidate.parent} does not exist; create it before saving."
+        )
+    with com_apartment():
+        doc = active_document(running_app())
+        require_idle(doc)
+        # SaveAs retargets the active document: after this call the drawing on
+        # screen *is* the file on disk, which the reply states plainly.
+        if candidate.suffix.lower() == ".dxf":
+            doc.SaveAs(str(candidate), AC_2018_DXF)
+        else:
+            doc.SaveAs(str(candidate))
+        return result(
+            True,
+            "Saved drawing to an explicit path.",
+            path=str(candidate),
+            format="dxf" if candidate.suffix.lower() == ".dxf" else "dwg",
+            drawing=document_info(doc),
+        )

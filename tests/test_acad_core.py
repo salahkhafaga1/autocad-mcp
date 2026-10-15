@@ -71,6 +71,28 @@ class FakeLayer:
         self.Freeze = False
         self.LayerOn = True
         self.Linetype = "Continuous"
+        self.Lineweight = -3  # AutoCAD's "Default" lineweight, in hundredths of a mm
+
+
+class FakeLinetypes:
+    def __init__(self, names: list[str]) -> None:
+        self._names = list(names)
+
+    @property
+    def Count(self) -> int:
+        return len(self._names)
+
+    def Item(self, key: object) -> str:
+        if isinstance(key, int):
+            return self._names[key]
+        for name in self._names:
+            if name.casefold() == str(key).casefold():
+                return name
+        raise Exception(f"linetype {key!r} not found")
+
+    def Add(self, name: str) -> str:
+        self._names.append(name)
+        return name
 
 
 class FakeLayers:
@@ -169,6 +191,8 @@ class FakeEntity(FlagRecorder):
         self.Linetype = "ByLayer"
         self.Closed = False
         self.Elevation = 0.0
+        self.Height = 0.0
+        self.Rotation = 0.0
         self.deleted = False
         self.moves: list[tuple] = []
         self.copies = 0
@@ -237,6 +261,9 @@ class FakeSpace(FlagRecorder):
     def AddText(self, text: str, point: object, height: float) -> FakeEntity:
         return self._record("text", FakeEntity("2D", "AcDbText", "0"), text, point, height)
 
+    def AddMText(self, point: object, width: float, text: str) -> FakeEntity:
+        return self._record("mtext", FakeEntity("32", "AcDbMText", "0"), point, width, text)
+
     def AddArc(self, center: object, radius: float, start: float, end: float) -> FakeEntity:
         return self._record("arc", FakeEntity("2E", "AcDbArc", "0"), center, radius, start, end)
 
@@ -276,9 +303,13 @@ class FakeDocument:
         blocks: list[FakeBlock] | None = None,
         entities: list[FakeEntity] | None = None,
         layouts: list[FakeLayout] | None = None,
+        cmdactive: int = 0,
+        linetypes: list[str] | None = None,
     ) -> None:
         self.insunits = insunits
+        self.cmdactive = cmdactive
         self.Layers = FakeLayers(layers or ["0"])
+        self.Linetypes = FakeLinetypes(linetypes or ["Continuous", "Dashed", "CENTER"])
         self.ActiveLayer = self.Layers.Item(0) if self.Layers.Count else None
         self.Blocks = FakeBlocks(
             blocks
@@ -292,9 +323,18 @@ class FakeDocument:
         )
         self.ActiveLayout = self.Layouts.Item(0) if self.Layouts.Count else None
         self.saved_as: tuple[str, tuple] | None = None
+        self.undo_marks: list[str] = []
         self._by_handle = {entity.Handle: entity for entity in (entities or [])}
 
+    def StartUndoMark(self) -> None:
+        self.undo_marks.append("start")
+
+    def EndUndoMark(self) -> None:
+        self.undo_marks.append("end")
+
     def GetVariable(self, name: str) -> int:
+        if name == "CMDACTIVE":
+            return self.cmdactive
         assert name == "INSUNITS"
         return self.insunits
 
@@ -1425,6 +1465,237 @@ class GeometryReadbackTests(unittest.TestCase):
         doc = FakeDocument(entities=[entity])
         run = run_tool("move_entity", {"handle": "L1", "from_mm": [0, 0], "to_mm": [30, 40]}, doc=doc)
         self.assertIn("geometry", run.data["entity"])
+
+
+class BatchDrawTests(unittest.TestCase):
+    """draw_batch: validate everything first, group as one undo step, report partials exactly."""
+
+    def batch(self, operations, doc=None, space=None, **kwargs):
+        arguments = {"operations": operations}
+        arguments.update(kwargs)
+        return run_tool("draw_batch", arguments, doc=doc, space=space)
+
+    def test_creates_each_kind_and_groups_one_undo(self) -> None:
+        operations = [
+            {"kind": "line", "start_mm": [0, 0], "end_mm": [1000, 0]},
+            {"kind": "circle", "center_mm": [500, 500], "radius_mm": 250},
+            {"kind": "text", "text": "Room A", "insertion_point_mm": [0, 0], "height_mm": 250},
+            {"kind": "point", "point_mm": [10, 20]},
+        ]
+        run = self.batch(operations)
+        self.assertTrue(run.payload["ok"])
+        self.assertEqual(run.data["created_count"], 4)
+        self.assertEqual(run.data["requested"], 4)
+        self.assertIsNone(run.data["failed_index"])
+        self.assertEqual(run.doc.undo_marks, ["start", "end"])
+
+    def test_all_layer_names_validated_before_any_creation(self) -> None:
+        space = FakeSpace()
+        doc = FakeDocument(layers=["0", "A-WALL"])
+        operations = [
+            {"kind": "line", "start_mm": [0, 0], "end_mm": [1, 0], "layer": "A-WALL"},
+            {"kind": "circle", "center_mm": [0, 0], "radius_mm": 1, "layer": "NOPE"},
+        ]
+        with self.assertRaises(RuntimeError):
+            self.batch(operations, doc=doc, space=space)
+        self.assertEqual(space.added, [])
+        self.assertEqual(doc.undo_marks, [])
+
+    def test_value_validation_is_all_or_nothing(self) -> None:
+        space = FakeSpace()
+        operations = [
+            {"kind": "line", "start_mm": [0, 0], "end_mm": [1, 0]},
+            {"kind": "circle", "center_mm": [0, 0], "radius_mm": 0},
+        ]
+        with self.assertRaises(ValueError):
+            self.batch(operations, space=space)
+        self.assertEqual(space.added, [])
+
+    def test_unknown_kind_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self.batch([{"kind": "spline", "start_mm": [0, 0]}])
+
+    def test_empty_operations_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self.batch([])
+
+    def test_missing_required_field_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self.batch([{"kind": "circle", "center_mm": [0, 0]}])
+
+    def test_partial_failure_reports_index_and_closes_mark(self) -> None:
+        space = FakeSpace()
+        space.AddCircle = mock.Mock(side_effect=Exception("COM blew up"))
+        operations = [
+            {"kind": "line", "start_mm": [0, 0], "end_mm": [1, 0]},
+            {"kind": "circle", "center_mm": [0, 0], "radius_mm": 5},
+            {"kind": "point", "point_mm": [1, 1]},
+        ]
+        run = self.batch(operations, space=space)
+        self.assertFalse(run.payload["ok"])
+        self.assertEqual(run.data["failed_index"], 1)
+        self.assertEqual(run.data["failed_kind"], "circle")
+        self.assertEqual(run.data["created_count"], 1)
+        self.assertEqual(run.data["requested"], 3)
+        self.assertEqual(run.doc.undo_marks, ["start", "end"])
+
+    def test_metre_drawing_scales_points(self) -> None:
+        operations = [{"kind": "line", "start_mm": [0, 0], "end_mm": [2000, 0]}]
+        run = self.batch(operations, doc=FakeDocument(insunits=6))
+        _, (start, end) = run.space.added[0]
+        self.assertEqual(variant_values(start), (0.0, 0.0, 0.0))
+        self.assertEqual(variant_values(end), (2.0, 0.0, 0.0))
+
+    def test_zero_sweep_arc_refused(self) -> None:
+        operations = [
+            {"kind": "arc", "center_mm": [0, 0], "radius_mm": 5, "start_angle_deg": 45, "end_angle_deg": 45}
+        ]
+        with self.assertRaises(ValueError):
+            self.batch(operations)
+
+    def test_varying_z_polyline_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self.batch([{"kind": "polyline", "vertices_mm": [[0, 0, 0], [1, 1, 5]]}])
+
+    def test_busy_autocad_refused(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.batch([{"kind": "point", "point_mm": [0, 0]}], doc=FakeDocument(cmdactive=1))
+
+    def test_flags_every_add_method_it_may_use(self) -> None:
+        run = self.batch([{"kind": "line", "start_mm": [0, 0], "end_mm": [1, 0]}])
+        self.assertEqual(run.space_calls, [(None, acad_core.BATCH_ADD_METHODS)])
+
+
+class MTextTests(unittest.TestCase):
+    def test_mtext_created_with_height_width_and_rotation(self) -> None:
+        run = run_tool(
+            "draw_mtext",
+            {
+                "text": "Line 1\nLine 2",
+                "insertion_point_mm": [100, 200],
+                "height_mm": 250,
+                "width_mm": 3000,
+                "rotation_deg": 90,
+            },
+        )
+        kind, (point, width, text) = run.space.added[0]
+        self.assertEqual(kind, "mtext")
+        self.assertEqual(variant_values(point), (100.0, 200.0, 0.0))
+        self.assertEqual(width, 3000.0)
+        self.assertEqual(text, "Line 1\nLine 2")
+        self.assertTrue(run.payload["ok"])
+        self.assertEqual(run.data["entity"]["object_name"], "AcDbMText")
+
+    def test_bad_layer_creates_nothing(self) -> None:
+        space = FakeSpace()
+        with self.assertRaises(RuntimeError):
+            run_tool(
+                "draw_mtext",
+                {"text": "x", "insertion_point_mm": [0, 0], "height_mm": 250, "layer": "NOPE"},
+                space=space,
+            )
+        self.assertEqual(space.added, [])
+
+    def test_empty_text_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            run_tool("draw_mtext", {"text": "", "insertion_point_mm": [0, 0], "height_mm": 250})
+
+    def test_negative_width_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            run_tool(
+                "draw_mtext",
+                {"text": "x", "insertion_point_mm": [0, 0], "height_mm": 250, "width_mm": -1},
+            )
+
+
+class LayerLinetypeTests(unittest.TestCase):
+    def test_linetype_and_lineweight_applied(self) -> None:
+        doc = FakeDocument(layers=["0", "A-WALL"], linetypes=["Continuous", "Dashed"])
+        run = run_tool(
+            "set_layer_linetype",
+            {"name": "A-WALL", "linetype": "Dashed", "lineweight_mm": 0.35},
+            doc=doc,
+        )
+        self.assertTrue(run.payload["ok"])
+        layer = doc.Layers.Item("A-WALL")
+        self.assertEqual(layer.Linetype, "Dashed")
+        self.assertEqual(layer.Lineweight, 35)
+        self.assertEqual(run.data["changed"], ["linetype", "lineweight_mm"])
+
+    def test_unknown_linetype_refused_and_layer_unchanged(self) -> None:
+        doc = FakeDocument(layers=["0", "A-WALL"], linetypes=["Continuous"])
+        with self.assertRaises(RuntimeError):
+            run_tool("set_layer_linetype", {"name": "A-WALL", "linetype": "Phantom"}, doc=doc)
+        self.assertEqual(doc.Layers.Item("A-WALL").Linetype, "Continuous")
+
+    def test_non_standard_lineweight_refused(self) -> None:
+        doc = FakeDocument(layers=["0", "A-WALL"])
+        with self.assertRaises(ValueError):
+            run_tool("set_layer_linetype", {"name": "A-WALL", "lineweight_mm": 0.42}, doc=doc)
+        self.assertEqual(doc.Layers.Item("A-WALL").Lineweight, -3)
+
+    def test_requires_at_least_one_property(self) -> None:
+        with self.assertRaises(ValueError):
+            run_tool("set_layer_linetype", {"name": "0"})
+
+    def test_missing_layer_refused(self) -> None:
+        with self.assertRaises(RuntimeError):
+            run_tool("set_layer_linetype", {"name": "NOPE", "lineweight_mm": 0.5})
+
+
+class SaveDrawingExplicitTests(unittest.TestCase):
+    def save(self, path: str) -> tuple[dict, FakeDocument]:
+        doc = FakeDocument()
+        with mock.patch.object(acad_core, "running_app", return_value=object()), \
+             mock.patch.object(acad_core, "active_document", return_value=doc):
+            payload = acad_core.HANDLERS["save_drawing_explicit"]({"path": path})
+        return payload, doc
+
+    def test_absolute_dwg_is_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "out.dwg"
+            payload, doc = self.save(str(target))
+            self.assertTrue(payload["ok"])
+            self.assertEqual(doc.saved_as, (str(target.resolve()), ()))
+
+    def test_dxf_target_passes_the_dxf_file_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "out.dxf"
+            _, doc = self.save(str(target))
+            self.assertEqual(doc.saved_as, (str(target.resolve()), (acad_core.AC_2018_DXF,)))
+
+    def test_relative_path_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self.save("out.dwg")
+
+    def test_wrong_extension_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                self.save(str(Path(tmp) / "out.txt"))
+
+    def test_existing_file_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "out.dwg"
+            target.write_bytes(b"existing")
+            with self.assertRaises(RuntimeError):
+                self.save(str(target))
+
+    def test_missing_parent_refused_without_creating_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "nope" / "out.dwg"
+            with self.assertRaises(RuntimeError):
+                self.save(str(target))
+            self.assertFalse(target.parent.exists())
+
+    def test_busy_autocad_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "out.dwg"
+            doc = FakeDocument(cmdactive=1)
+            with mock.patch.object(acad_core, "running_app", return_value=object()), \
+                 mock.patch.object(acad_core, "active_document", return_value=doc):
+                with self.assertRaises(RuntimeError):
+                    acad_core.HANDLERS["save_drawing_explicit"]({"path": str(target)})
+            self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":
